@@ -1,0 +1,21 @@
+{
+  "name": "klootschieten-api",
+  "version": "2.0.0",
+  "description": "REST API + scraper for klootschieten match data (nkbuitslagen.nl + tkc-klootschieten.nl)",
+  "main": "src/server.js",
+  "scripts": {
+    "start":       "node src/server.js",
+    "dev":         "node --watch src/server.js",
+    "scrape":      "node src/jobs/scrape.js",
+    "setup":       "bash setup.sh"
+  },
+  "engines": { "node": ">=18.0.0" },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "cheerio":        "^1.0.0",
+    "express":        "^4.19.2",
+    "node-cron":      "^3.0.3",
+    "playwright":     "^1.44.0"
+  },
+  "license": "MIT"
+}
