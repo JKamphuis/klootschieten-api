@@ -120,7 +120,7 @@ async function getActivePage(page) {
 async function scrapeLeague(page, league, category) {
   console.log(`  [NKB] ${category} / ${league.name}`);
 
-  await page.goto(league.url, { waitUntil: 'networkidle', timeout: 30_000 });
+  await page.goto(league.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
   // Wait for real data rows — not the "Laden..." placeholder
   try {
