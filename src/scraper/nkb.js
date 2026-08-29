@@ -64,9 +64,29 @@ async function getVisibleRows(page) {
       .filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0)
       .map(tr => {
         const cells = Array.from(tr.querySelectorAll('td'));
-        return cells.map(td => td.innerText.trim());
+        return cells.map(td => {
+          // Prefer data-order attribute (DataTables often stores sort value there,
+          // which for dates is the ISO date string)
+          const dataOrder = td.getAttribute('data-order') || td.getAttribute('data-sort');
+          if (dataOrder) return dataOrder.trim();
+          // Fall back to innerText with collapsed whitespace
+          return (td.innerText || td.textContent || '').replace(/\s+/g, ' ').trim();
+        });
       });
   });
+}
+
+/** Log first visible row raw HTML for debugging — called once per league */
+async function debugFirstRow(page) {
+  const info = await page.evaluate(() => {
+    const table = document.querySelector('table');
+    if (!table) return 'no table';
+    const rows = Array.from(table.querySelectorAll('tbody tr'));
+    const visible = rows.filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
+    if (!visible.length) return 'no visible rows';
+    return visible[0].innerHTML.slice(0, 800);
+  });
+  console.log('    [debug] first row HTML:', info);
 }
 
 /**
@@ -98,6 +118,9 @@ async function scrapeLeague(page, league, category) {
 
   const matches = [];
   let pageNum = 1;
+
+  // Debug: log raw HTML of first row to reveal date cell structure
+  await debugFirstRow(page);
 
   while (true) {
     // Read only currently visible rows
