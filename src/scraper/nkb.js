@@ -1,16 +1,8 @@
 'use strict';
-/**
- * src/scraper/nkb.js
- *
- * Scrapes all Junioren + Senioren league pages on nkbuitslagen.nl.
- * Tables are JavaScript-rendered, so we use Playwright (headless Chromium).
- */
-
 const cheerio    = require('cheerio');
 const playwright = require('playwright');
 const { parseTeam } = require('./normalise');
 
-// All league URLs on nkbuitslagen.nl
 const LEAGUES = {
   junioren: [
     { name: 'Klasse A', url: 'https://nkbuitslagen.nl/klasse-a-junioren/' },
@@ -21,7 +13,7 @@ const LEAGUES = {
     { name: 'Klasse F', url: 'https://nkbuitslagen.nl/klasse-f/' },
   ],
   senioren: [
-    { name: 'Hoofdklasse', url: 'https://nkbuitslagen.nl/hoofdklasse/' },
+    { name: 'Hoofdklasse',  url: 'https://nkbuitslagen.nl/hoofdklasse/' },
     { name: 'Klasse 1 NKB', url: 'https://nkbuitslagen.nl/klasse-1/' },
     { name: 'Klasse 2 NKB', url: 'https://nkbuitslagen.nl/klasse-2/' },
     { name: 'Klasse 3 NKB', url: 'https://nkbuitslagen.nl/klasse-3/' },
@@ -37,26 +29,41 @@ const LEAGUES = {
   ],
 };
 
-// ─── date helpers ────────────────────────────────────────────────────────────
-
 function parseNkbDate(raw) {
   if (!raw) return null;
-  // yyyy-mm-dd (possibly with time suffix)
+  raw = raw.trim();
   if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
-  // dd-mm-yyyy
   const m = raw.match(/^(\d{2})-(\d{2})-(\d{4})/);
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   return null;
 }
 
-// ─── per-league scrape ───────────────────────────────────────────────────────
+function parseTableRows($, leagueName, category, sourceUrl) {
+  const matches = [];
+  $('table').first().find('tbody tr').each((_, tr) => {
+    const cells = $(tr).find('td');
+    if (cells.length < 4) return;
+    const dateRaw = $(cells[1]).text().trim();
+    const homeRaw = $(cells[2]).text().trim();
+    const awayRaw = $(cells[3]).text().trim();
+    if (!homeRaw || !awayRaw) return;
+    const scoreH = cells.length > 4 ? $(cells[4]).text().trim() : '';
+    const scoreA = cells.length > 5 ? $(cells[5]).text().trim() : '';
+    matches.push({
+      source: 'nkb', category, league: leagueName,
+      match_date: parseNkbDate(dateRaw), match_time: null, speeldag: null,
+      home_team: parseTeam(homeRaw), away_team: parseTeam(awayRaw),
+      home_score: scoreH !== '' ? (parseInt(scoreH, 10) || null) : null,
+      away_score: scoreA !== '' ? (parseInt(scoreA, 10) || null) : null,
+      location: null, source_url: sourceUrl,
+    });
+  });
+  return matches;
+}
 
 async function scrapeLeague(page, league, category) {
   console.log(`  [NKB] ${category} / ${league.name}`);
-
   await page.goto(league.url, { waitUntil: 'networkidle', timeout: 30_000 });
-
-  // Wait for at least one data cell in the first table
   try {
     await page.waitForSelector('table:first-of-type tbody tr td', { timeout: 8_000 });
   } catch {
@@ -64,65 +71,48 @@ async function scrapeLeague(page, league, category) {
     return [];
   }
 
-  const html    = await page.content();
-  const $       = cheerio.load(html);
   const matches = [];
+  let pageNum = 1;
 
-  // First table = Programmatabel
-  // Columns: Klasse | Wedstrijddag | Thuis team | Uit team | Thuis score | Uit score | Verslag
-  $('table').first().find('tbody tr').each((_, tr) => {
-    const cells = $(tr).find('td');
-    if (cells.length < 4) return;
+  while (true) {
+    const $ = cheerio.load(await page.content());
+    const pageMatches = parseTableRows($, league.name, category, league.url);
+    matches.push(...pageMatches);
+    console.log(`    → pagina ${pageNum}: ${pageMatches.length} rijen`);
 
-    const dateRaw  = $(cells[1]).text().trim();
-    const homeRaw  = $(cells[2]).text().trim();
-    const awayRaw  = $(cells[3]).text().trim();
-    const scoreH   = $(cells[4])?.text().trim() || '';
-    const scoreA   = $(cells[5])?.text().trim() || '';
+    const nextBtn = await page.$('a.paginate_button.next:not(.disabled), li.next:not(.disabled) a');
+    if (!nextBtn) break;
+    const isDisabled = await nextBtn.evaluate(el =>
+      el.classList.contains('disabled') ||
+      el.closest('li')?.classList.contains('disabled') ||
+      el.getAttribute('aria-disabled') === 'true'
+    );
+    if (isDisabled) break;
 
-    if (!homeRaw || !awayRaw) return;
+    await nextBtn.click();
+    await page.waitForTimeout(600);
+    await page.waitForLoadState('networkidle').catch(() => {});
+    pageNum++;
+    if (pageNum > 50) break;
+  }
 
-    const homeTeam = parseTeam(homeRaw);
-    const awayTeam = parseTeam(awayRaw);
-
-    matches.push({
-      source      : 'nkb',
-      category,
-      league      : league.name,
-      match_date  : parseNkbDate(dateRaw),
-      match_time  : null,
-      speeldag    : null,
-      home_team   : homeTeam,
-      away_team   : awayTeam,
-      home_score  : scoreH !== '' ? parseInt(scoreH, 10) || null : null,
-      away_score  : scoreA !== '' ? parseInt(scoreA, 10) || null : null,
-      location    : null,
-      source_url  : league.url,
-    });
-  });
-
-  console.log(`    → ${matches.length} wedstrijden`);
+  console.log(`    → totaal: ${matches.length} wedstrijden`);
   return matches;
 }
-
-// ─── main export ─────────────────────────────────────────────────────────────
 
 async function scrapeAllNkb() {
   const browser = await playwright.chromium.launch({ headless: true });
   const page    = await browser.newPage();
   const all     = [];
-
   try {
-    for (const [category, leagues] of Object.entries(LEAGUES)) {
+    for (const [category, leagues] of Object.entries(LEAGUES))
       for (const league of leagues) {
-        const matches = await scrapeLeague(page, league, category);
-        all.push(...matches);
+        try { all.push(...await scrapeLeague(page, league, category)); }
+        catch (err) { console.warn(`  [NKB] fout bij ${league.url}: ${err.message}`); }
       }
-    }
   } finally {
     await browser.close();
   }
-
   return all;
 }
 
