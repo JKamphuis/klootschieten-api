@@ -1,9 +1,15 @@
 'use strict';
 /**
  * src/scraper/nkb.js
+ *
+ * DataTables note: NKB uses DataTables which renders ALL rows in the DOM
+ * but hides non-visible pages with display:none. Pagination buttons
+ * show/hide rows without changing the DOM count.
+ *
+ * Strategy: click "Volgende" to advance pages, collect only VISIBLE rows
+ * each time using page.$$eval filtering on offsetParent !== null.
  */
 
-const cheerio    = require('cheerio');
 const playwright = require('playwright');
 const { parseTeam } = require('./normalise');
 
@@ -42,34 +48,35 @@ function parseNkbDate(raw) {
   return null;
 }
 
-function parseTableRows($, leagueName, category, sourceUrl) {
-  const matches = [];
-  $('table').first().find('tbody tr').each((_, tr) => {
-    const cells = $(tr).find('td');
-    if (cells.length < 4) return;
-    const dateRaw = $(cells[1]).text().trim();
-    const homeRaw = $(cells[2]).text().trim();
-    const awayRaw = $(cells[3]).text().trim();
-    if (!homeRaw || !awayRaw) return;
-    const scoreH = cells.length > 4 ? $(cells[4]).text().trim() : '';
-    const scoreA = cells.length > 5 ? $(cells[5]).text().trim() : '';
-    matches.push({
-      source: 'nkb', category, league: leagueName,
-      match_date: parseNkbDate(dateRaw), match_time: null, speeldag: null,
-      home_team: parseTeam(homeRaw), away_team: parseTeam(awayRaw),
-      home_score: scoreH !== '' ? (parseInt(scoreH, 10) || null) : null,
-      away_score: scoreA !== '' ? (parseInt(scoreA, 10) || null) : null,
-      location: null, source_url: sourceUrl,
-    });
+/**
+ * Extract visible rows from the first table via page.evaluate.
+ * DataTables hides rows with display:none — we filter those out.
+ * Returns array of plain objects with the cell text values.
+ *
+ * Columns: 0=Klasse 1=Wedstrijddag 2=Thuis 3=Uit 4=Thuis score 5=Uit score 6=Verslag
+ */
+async function getVisibleRows(page) {
+  return page.evaluate(() => {
+    const table = document.querySelector('table');
+    if (!table) return [];
+    const rows = Array.from(table.querySelectorAll('tbody tr'));
+    return rows
+      .filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0)
+      .map(tr => {
+        const cells = Array.from(tr.querySelectorAll('td'));
+        return cells.map(td => td.innerText.trim());
+      });
   });
-  return matches;
 }
 
-/** Count visible tbody rows in the first table via page.evaluate */
-async function countRows(page) {
+/**
+ * Get the active page number from the DataTables pagination info.
+ * Returns null if not found.
+ */
+async function getActivePage(page) {
   return page.evaluate(() => {
-    const table = document.querySelector('table tbody');
-    return table ? table.querySelectorAll('tr').length : 0;
+    const active = document.querySelector('button.dt-paging-button.current, .paginate_button.current');
+    return active ? active.textContent.trim() : null;
   });
 }
 
@@ -78,9 +85,12 @@ async function scrapeLeague(page, league, category) {
 
   await page.goto(league.url, { waitUntil: 'networkidle', timeout: 30_000 });
 
-  // Give JS-rendered tables extra time — slow pages need up to 15s
+  // Wait for the table to have at least one visible row
   try {
-    await page.waitForSelector('table tbody tr td', { timeout: 15_000 });
+    await page.waitForFunction(() => {
+      const rows = document.querySelectorAll('table tbody tr');
+      return Array.from(rows).some(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
+    }, { timeout: 15_000 });
   } catch {
     console.log('    → tabel leeg / seizoen nog niet begonnen');
     return [];
@@ -90,42 +100,82 @@ async function scrapeLeague(page, league, category) {
   let pageNum = 1;
 
   while (true) {
-    // Parse current page
-    const $ = cheerio.load(await page.content());
-    const pageMatches = parseTableRows($, league.name, category, league.url);
-    matches.push(...pageMatches);
-    console.log(`    → pagina ${pageNum}: ${pageMatches.length} rijen`);
+    // Read only currently visible rows
+    const rows = await getVisibleRows(page);
+    console.log(`    → pagina ${pageNum}: ${rows.length} rijen zichtbaar`);
 
-    // Find the Next button — exact selector from the live site
+    for (const cells of rows) {
+      if (cells.length < 4) continue;
+
+      // col 1 = Wedstrijddag, col 2 = Thuis, col 3 = Uit
+      const dateRaw  = cells[1] || '';
+      const homeRaw  = cells[2] || '';
+      const awayRaw  = cells[3] || '';
+      if (!homeRaw || !awayRaw) continue;
+
+      const scoreH = cells[4] || '';
+      const scoreA = cells[5] || '';
+
+      matches.push({
+        source     : 'nkb',
+        category,
+        league     : league.name,
+        match_date : parseNkbDate(dateRaw),
+        match_time : null,
+        speeldag   : null,
+        home_team  : parseTeam(homeRaw),
+        away_team  : parseTeam(awayRaw),
+        home_score : scoreH !== '' ? (parseInt(scoreH, 10) || null) : null,
+        away_score : scoreA !== '' ? (parseInt(scoreA, 10) || null) : null,
+        location   : null,
+        source_url : league.url,
+      });
+    }
+
+    // Find the Next button
     const nextBtn = await page.$('button.dt-paging-button.next');
-    if (!nextBtn) break;
+    if (!nextBtn) {
+      console.log('    → geen volgende-knop gevonden, klaar');
+      break;
+    }
 
-    // Check if disabled (DataTables adds 'disabled' class when on last page)
-    const disabled = await nextBtn.evaluate(el => el.disabled || el.classList.contains('disabled'));
-    if (disabled) break;
+    // Check disabled state — DataTables sets both class and attribute
+    const isDisabled = await page.evaluate(btn => {
+      return btn.disabled ||
+        btn.classList.contains('disabled') ||
+        btn.getAttribute('aria-disabled') === 'true';
+    }, nextBtn);
 
-    // Remember current row count so we can wait for table to re-render
-    const rowsBefore = await countRows(page);
+    if (isDisabled) {
+      console.log('    → laatste pagina bereikt');
+      break;
+    }
+
+    // Remember which page we're on before clicking
+    const currentPage = await getActivePage(page);
 
     await nextBtn.click();
 
-    // Wait until row count changes (table re-rendered) — max 5s
+    // Wait until the active page indicator changes, meaning DataTables
+    // has finished re-rendering the visible rows — max 5 seconds
     try {
-      await page.waitForFunction(
-        (before) => {
-          const t = document.querySelector('table tbody');
-          return t && t.querySelectorAll('tr').length !== before;
-        },
-        rowsBefore,
-        { timeout: 5_000 }
-      );
+      await page.waitForFunction((prevPage) => {
+        const active = document.querySelector(
+          'button.dt-paging-button.current, .paginate_button.current'
+        );
+        return active && active.textContent.trim() !== prevPage;
+      }, currentPage, { timeout: 5_000 });
     } catch {
-      // Timed out waiting for new rows — we're probably on the last page
+      // If the page indicator didn't change, we're stuck — stop here
+      console.log('    → paginering reageert niet, stoppen');
       break;
     }
 
     pageNum++;
-    if (pageNum > 10) break; // max 10 pages (150 matches per league is plenty)
+    if (pageNum > 20) {
+      console.log('    → veiligheidsgrens van 20 paginas bereikt');
+      break;
+    }
   }
 
   console.log(`    → totaal: ${matches.length} wedstrijden`);
@@ -136,6 +186,7 @@ async function scrapeAllNkb() {
   const browser = await playwright.chromium.launch({ headless: true });
   const page    = await browser.newPage();
   const all     = [];
+
   try {
     for (const [category, leagues] of Object.entries(LEAGUES)) {
       for (const league of leagues) {
@@ -149,6 +200,7 @@ async function scrapeAllNkb() {
   } finally {
     await browser.close();
   }
+
   return all;
 }
 
