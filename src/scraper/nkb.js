@@ -1,4 +1,8 @@
 'use strict';
+/**
+ * src/scraper/nkb.js
+ */
+
 const cheerio    = require('cheerio');
 const playwright = require('playwright');
 const { parseTeam } = require('./normalise');
@@ -61,11 +65,22 @@ function parseTableRows($, leagueName, category, sourceUrl) {
   return matches;
 }
 
+/** Count visible tbody rows in the first table via page.evaluate */
+async function countRows(page) {
+  return page.evaluate(() => {
+    const table = document.querySelector('table tbody');
+    return table ? table.querySelectorAll('tr').length : 0;
+  });
+}
+
 async function scrapeLeague(page, league, category) {
   console.log(`  [NKB] ${category} / ${league.name}`);
+
   await page.goto(league.url, { waitUntil: 'networkidle', timeout: 30_000 });
+
+  // Give JS-rendered tables extra time — slow pages need up to 15s
   try {
-    await page.waitForSelector('table:first-of-type tbody tr td', { timeout: 8_000 });
+    await page.waitForSelector('table tbody tr td', { timeout: 15_000 });
   } catch {
     console.log('    → tabel leeg / seizoen nog niet begonnen');
     return [];
@@ -75,25 +90,42 @@ async function scrapeLeague(page, league, category) {
   let pageNum = 1;
 
   while (true) {
+    // Parse current page
     const $ = cheerio.load(await page.content());
     const pageMatches = parseTableRows($, league.name, category, league.url);
     matches.push(...pageMatches);
     console.log(`    → pagina ${pageNum}: ${pageMatches.length} rijen`);
 
-    const nextBtn = await page.$('a.paginate_button.next:not(.disabled), li.next:not(.disabled) a');
+    // Find the Next button — exact selector from the live site
+    const nextBtn = await page.$('button.dt-paging-button.next');
     if (!nextBtn) break;
-    const isDisabled = await nextBtn.evaluate(el =>
-      el.classList.contains('disabled') ||
-      el.closest('li')?.classList.contains('disabled') ||
-      el.getAttribute('aria-disabled') === 'true'
-    );
-    if (isDisabled) break;
+
+    // Check if disabled (DataTables adds 'disabled' class when on last page)
+    const disabled = await nextBtn.evaluate(el => el.disabled || el.classList.contains('disabled'));
+    if (disabled) break;
+
+    // Remember current row count so we can wait for table to re-render
+    const rowsBefore = await countRows(page);
 
     await nextBtn.click();
-    await page.waitForTimeout(600);
-    await page.waitForLoadState('networkidle').catch(() => {});
+
+    // Wait until row count changes (table re-rendered) — max 5s
+    try {
+      await page.waitForFunction(
+        (before) => {
+          const t = document.querySelector('table tbody');
+          return t && t.querySelectorAll('tr').length !== before;
+        },
+        rowsBefore,
+        { timeout: 5_000 }
+      );
+    } catch {
+      // Timed out waiting for new rows — we're probably on the last page
+      break;
+    }
+
     pageNum++;
-    if (pageNum > 50) break;
+    if (pageNum > 10) break; // max 10 pages (150 matches per league is plenty)
   }
 
   console.log(`    → totaal: ${matches.length} wedstrijden`);
@@ -105,11 +137,15 @@ async function scrapeAllNkb() {
   const page    = await browser.newPage();
   const all     = [];
   try {
-    for (const [category, leagues] of Object.entries(LEAGUES))
+    for (const [category, leagues] of Object.entries(LEAGUES)) {
       for (const league of leagues) {
-        try { all.push(...await scrapeLeague(page, league, category)); }
-        catch (err) { console.warn(`  [NKB] fout bij ${league.url}: ${err.message}`); }
+        try {
+          all.push(...await scrapeLeague(page, league, category));
+        } catch (err) {
+          console.warn(`  [NKB] fout bij ${league.url}: ${err.message}`);
+        }
       }
+    }
   } finally {
     await browser.close();
   }
