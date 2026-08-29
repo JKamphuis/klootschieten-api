@@ -612,9 +612,9 @@ function getStats(db) {
     leagues_total   : db.prepare('SELECT COUNT(*) AS n FROM leagues').get().n,
     last_scrape     : getLastScrapeInfo(db),
     by_source       : db.prepare(`
-      SELECT source, category, COUNT(*) AS matches
+      SELECT m.source, l.category, COUNT(*) AS matches
       FROM matches m JOIN leagues l ON l.id = m.league_id
-      GROUP BY source, category
+      GROUP BY m.source, l.category
     `).all(),
   };
 }
