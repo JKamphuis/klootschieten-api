@@ -39,12 +39,29 @@ const LEAGUES = {
   ],
 };
 
+const DUTCH_MONTHS_NKB = {
+  januari:1, februari:2, maart:3, april:4, mei:5, juni:6,
+  juli:7, augustus:8, september:9, oktober:10, november:11, december:12,
+};
+
 function parseNkbDate(raw) {
   if (!raw) return null;
   raw = raw.trim();
+  // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
-  const m = raw.match(/^(\d{2})-(\d{2})-(\d{4})/);
-  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  // DD-MM-YYYY
+  const dmy = raw.match(/^(\d{2})-(\d{2})-(\d{4})/);
+  if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+  // Dutch long form: "2 mei 2027" or "12 september 2026"
+  const dutch = raw.match(/(\d{1,2})\s+([a-z]+)\s+(\d{4})/i);
+  if (dutch) {
+    const month = DUTCH_MONTHS_NKB[dutch[2].toLowerCase()];
+    if (month) {
+      const mm = String(month).padStart(2, '0');
+      const dd = dutch[1].padStart(2, '0');
+      return `${dutch[3]}-${mm}-${dd}`;
+    }
+  }
   return null;
 }
 
@@ -105,12 +122,21 @@ async function scrapeLeague(page, league, category) {
 
   await page.goto(league.url, { waitUntil: 'networkidle', timeout: 30_000 });
 
-  // Wait for the table to have at least one visible row
+  // Wait for real data rows — not the "Laden..." placeholder
   try {
     await page.waitForFunction(() => {
-      const rows = document.querySelectorAll('table tbody tr');
-      return Array.from(rows).some(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
-    }, { timeout: 15_000 });
+      const rows = Array.from(document.querySelectorAll('table tbody tr'));
+      const visible = rows.filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
+      if (!visible.length) return false;
+      // Reject if the only visible row is a colspan "Laden..." or "dt-empty" cell
+      if (visible.length === 1) {
+        const firstCell = visible[0].querySelector('td');
+        if (!firstCell) return false;
+        const colspan = firstCell.getAttribute('colspan');
+        if (colspan && parseInt(colspan) > 1) return false;  // loading/empty placeholder
+      }
+      return true;
+    }, { timeout: 20_000 });
   } catch {
     console.log('    → tabel leeg / seizoen nog niet begonnen');
     return [];
