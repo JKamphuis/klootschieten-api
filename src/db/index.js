@@ -409,44 +409,69 @@ function getMatchById(db, id, clubIds = []) {
  * plus clubIds access restriction.
  */
 function computeRanking(db, filters = {}, clubIds = []) {
-  const rankFilters = { ...filters, played: 'true' };
-  const { conditions, params } = buildMatchConditions(rankFilters, clubIds);
-  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-
-  const played = db.prepare(`${MATCH_SELECT} ${where} ORDER BY m.match_date ASC`).all(params);
-
   const stats = {};
 
   function getOrInit(teamName, clubName) {
     if (!stats[teamName]) {
       stats[teamName] = {
-        team          : teamName,
-        club          : clubName,
-        played        : 0,
-        won           : 0,
-        drawn         : 0,
-        lost          : 0,
-        points_for    : 0,   // total points scored
-        points_against: 0,   // total points conceded
-        points        : 0,   // ranking points (same as points_for in klootschieten)
+        team: teamName, club: clubName,
+        played: 0, won: 0, drawn: 0, lost: 0,
+        points_for: 0, points_against: 0, points: 0,
       };
     }
     return stats[teamName];
   }
 
+  // ── Step 1: seed ALL teams that appear in any match for this league ──────
+  // Query without the played filter so teams with 0 played matches still appear.
+  const seedFilters = { ...filters };
+  delete seedFilters.played;
+  const { conditions: seedConds, params: seedParams } = buildMatchConditions(seedFilters, clubIds);
+  const seedWhere = seedConds.length ? 'WHERE ' + seedConds.join(' AND ') : '';
+
+  // Get distinct teams from all scheduled matches (home and away separately)
+  const seedRows = db.prepare(`
+    SELECT DISTINCT
+      ht.display_name AS team,
+      COALESCE(NULLIF(hc.display_name,''), hc.name) AS club
+    FROM matches m
+    JOIN leagues l  ON l.id = m.league_id
+    JOIN teams   ht ON ht.id = m.home_team_id
+    JOIN clubs   hc ON hc.id = ht.club_id
+    JOIN teams   at ON at.id = m.away_team_id
+    JOIN clubs   ac ON ac.id = at.club_id
+    ${seedWhere}
+    UNION
+    SELECT DISTINCT
+      at.display_name AS team,
+      COALESCE(NULLIF(ac.display_name,''), ac.name) AS club
+    FROM matches m
+    JOIN leagues l  ON l.id = m.league_id
+    JOIN teams   ht ON ht.id = m.home_team_id
+    JOIN clubs   hc ON hc.id = ht.club_id
+    JOIN teams   at ON at.id = m.away_team_id
+    JOIN clubs   ac ON ac.id = at.club_id
+    ${seedWhere}
+  `).all(seedParams);
+
+  for (const { team, club } of seedRows) getOrInit(team, club);
+
+  // ── Step 2: accumulate stats from played matches only ───────────────────
+  const playedFilters = { ...filters, played: 'true' };
+  const { conditions: playedConds, params: playedParams } = buildMatchConditions(playedFilters, clubIds);
+  const playedWhere = playedConds.length ? 'WHERE ' + playedConds.join(' AND ') : '';
+
+  const played = db.prepare(`${MATCH_SELECT} ${playedWhere} ORDER BY m.match_date ASC`).all(playedParams);
+
   for (const m of played) {
     const home = getOrInit(m.home_team, m.home_club);
     const away = getOrInit(m.away_team, m.away_club);
 
-    home.played++;
-    away.played++;
-
+    home.played++;      away.played++;
     home.points_for     += m.home_score;
     home.points_against += m.away_score;
     away.points_for     += m.away_score;
     away.points_against += m.home_score;
-
-    // In klootschieten the points earned = the score value
     home.points += m.home_score;
     away.points += m.away_score;
 
