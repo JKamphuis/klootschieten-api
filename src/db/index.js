@@ -128,6 +128,50 @@ function migrate(db) {
     db.exec("UPDATE clubs SET display_name = name WHERE display_name = ''");
     console.log('[migrate] Added display_name column to clubs table');
   }
+
+  // ── Remove match_date from UNIQUE constraint on matches ──────────────────
+  // Old constraint included match_date, preventing updates from NULL to a real date.
+  // Detect by checking if any unique index on matches includes match_date.
+  const matchIndexes = db.prepare("PRAGMA index_list(matches)").all();
+  const hasOldUnique = matchIndexes.some(idx => {
+    if (!idx.unique) return false;
+    const cols = db.prepare("PRAGMA index_info(" + idx.name + ")").all().map(c => c.name);
+    return cols.includes('match_date') && cols.includes('home_team_id');
+  });
+
+  if (hasOldUnique) {
+    console.log('[migrate] Rebuilding matches table to fix UNIQUE constraint...');
+    db.exec(`
+      CREATE TABLE matches_new (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        source        TEXT    NOT NULL,
+        league_id     INTEGER NOT NULL REFERENCES leagues(id),
+        home_team_id  INTEGER NOT NULL REFERENCES teams(id),
+        away_team_id  INTEGER NOT NULL REFERENCES teams(id),
+        match_date    TEXT,
+        match_time    TEXT,
+        speeldag      INTEGER,
+        home_score    INTEGER,
+        away_score    INTEGER,
+        location      TEXT,
+        source_url    TEXT,
+        fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(source, league_id, home_team_id, away_team_id)
+      );
+      INSERT OR IGNORE INTO matches_new
+        SELECT id, source, league_id, home_team_id, away_team_id,
+               match_date, match_time, speeldag, home_score, away_score,
+               location, source_url, fetched_at
+        FROM matches;
+      DROP TABLE matches;
+      ALTER TABLE matches_new RENAME TO matches;
+      CREATE INDEX IF NOT EXISTS idx_match_date   ON matches(match_date);
+      CREATE INDEX IF NOT EXISTS idx_match_league ON matches(league_id);
+      CREATE INDEX IF NOT EXISTS idx_match_home   ON matches(home_team_id);
+      CREATE INDEX IF NOT EXISTS idx_match_away   ON matches(away_team_id);
+    `);
+    console.log('[migrate] matches table rebuilt successfully');
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,12 +309,15 @@ function getOrCreateTeam(db, { clubId, teamNr, displayName }) {
 }
 
 function upsertMatch(db, row) {
+  // Look up by source + league + teams only — NOT by date.
+  // The date may start as NULL and be filled in later; we always want to
+  // update it rather than treat a date change as a new match.
   const existing = db.prepare(`
-    SELECT id, home_score, away_score FROM matches
+    SELECT id, match_date, match_time, speeldag,
+           home_score, away_score, location
+    FROM matches
     WHERE source = ? AND league_id = ? AND home_team_id = ? AND away_team_id = ?
-      AND (match_date = ? OR (match_date IS NULL AND ? IS NULL))
-  `).get(row.source, row.league_id, row.home_team_id, row.away_team_id,
-         row.match_date, row.match_date);
+  `).get(row.source, row.league_id, row.home_team_id, row.away_team_id);
 
   if (!existing) {
     db.prepare(`
@@ -282,10 +329,25 @@ function upsertMatch(db, row) {
     return 'added';
   }
 
-  if (existing.home_score !== row.home_score || existing.away_score !== row.away_score) {
+  // Check if anything actually changed
+  const changed =
+    existing.match_date  !== row.match_date  ||
+    existing.match_time  !== row.match_time  ||
+    existing.speeldag    !== row.speeldag    ||
+    existing.home_score  !== row.home_score  ||
+    existing.away_score  !== row.away_score  ||
+    existing.location    !== row.location;
+
+  if (changed) {
     db.prepare(`
-      UPDATE matches SET home_score = @home_score, away_score = @away_score,
-        match_time = @match_time, location = @location, fetched_at = datetime('now')
+      UPDATE matches
+      SET match_date  = @match_date,
+          match_time  = @match_time,
+          speeldag    = @speeldag,
+          home_score  = @home_score,
+          away_score  = @away_score,
+          location    = @location,
+          fetched_at  = datetime('now')
       WHERE id = @id
     `).run({ ...row, id: existing.id });
     return 'updated';
