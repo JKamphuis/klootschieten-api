@@ -233,17 +233,23 @@ async function scrapeLeague(page, league, category) {
 
 async function scrapeAllNkb() {
   const browser = await playwright.chromium.launch({ headless: true });
-  const page    = await browser.newPage();
   const all     = [];
 
   try {
     for (const [category, leagues] of Object.entries(LEAGUES)) {
       for (const league of leagues) {
+        // Fresh page per league — avoids interrupted navigation errors from
+        // the previous page still loading when we navigate to the next one.
+        const page = await browser.newPage();
         try {
           all.push(...await scrapeLeague(page, league, category));
         } catch (err) {
           console.warn(`  [NKB] fout bij ${league.url}: ${err.message}`);
+        } finally {
+          await page.close();
         }
+        // Brief pause between leagues to avoid rate-limiting
+        await new Promise(r => setTimeout(r, 1500));
       }
     }
   } finally {
