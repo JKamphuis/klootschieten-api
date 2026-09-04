@@ -484,14 +484,17 @@ function computeRanking(db, filters = {}, clubIds = []) {
     return stats[teamName];
   }
 
-  // ── Step 1: seed ALL teams that appear in any match for this league ──────
-  // Query without the played filter so teams with 0 played matches still appear.
+  // ── Step 1 & 2: always use ALL matches in the league for calculations ────
+  // Club access (clubIds) must NOT filter which matches are used to calculate
+  // standings — otherwise a club that hasn't played yet would see an empty or
+  // wrong ranking. Instead we calculate from all matches, then filter the
+  // output rows to only show the clubs the key has access to.
   const seedFilters = { ...filters };
   delete seedFilters.played;
-  const { conditions: seedConds, params: seedParams } = buildMatchConditions(seedFilters, clubIds);
+  // No clubIds here — full league data for accurate standings
+  const { conditions: seedConds, params: seedParams } = buildMatchConditions(seedFilters, []);
   const seedWhere = seedConds.length ? 'WHERE ' + seedConds.join(' AND ') : '';
 
-  // Get distinct teams from all scheduled matches (home and away separately)
   const seedRows = db.prepare(`
     SELECT DISTINCT
       ht.display_name AS team,
@@ -518,9 +521,9 @@ function computeRanking(db, filters = {}, clubIds = []) {
 
   for (const { team, club } of seedRows) getOrInit(team, club);
 
-  // ── Step 2: accumulate stats from played matches only ───────────────────
   const playedFilters = { ...filters, played: 'true' };
-  const { conditions: playedConds, params: playedParams } = buildMatchConditions(playedFilters, clubIds);
+  // Again no clubIds — calculate from all played matches in the league
+  const { conditions: playedConds, params: playedParams } = buildMatchConditions(playedFilters, []);
   const playedWhere = playedConds.length ? 'WHERE ' + playedConds.join(' AND ') : '';
 
   const played = db.prepare(`${MATCH_SELECT} ${playedWhere} ORDER BY m.match_date ASC`).all(playedParams);
@@ -542,7 +545,21 @@ function computeRanking(db, filters = {}, clubIds = []) {
     else                                   { home.drawn++; away.drawn++; }
   }
 
-  return Object.values(stats)
+  // ── Step 3: filter output rows to clubs this key has access to ───────────
+  // If clubIds is empty the key is unrestricted — return the full ranking.
+  // Otherwise only return rows where the team belongs to an allowed club.
+  let rows = Object.values(stats);
+  if (clubIds.length > 0) {
+    // Look up club names for the allowed clubIds
+    const allowedClubNames = new Set(
+      db.prepare(
+        `SELECT COALESCE(NULLIF(display_name,''), name) AS name FROM clubs WHERE id IN (${clubIds.map(() => '?').join(',')})`
+      ).all(...clubIds).map(r => r.name)
+    );
+    rows = rows.filter(r => allowedClubNames.has(r.club));
+  }
+
+  return rows
     .sort((a, b) =>
       (b.points       - a.points)       ||
       (b.won          - a.won)          ||
