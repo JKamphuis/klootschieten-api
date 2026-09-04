@@ -20,7 +20,6 @@ const LEAGUES = {
     { name: 'Klasse C', url: 'https://nkbuitslagen.nl/klasse-c/' },
     { name: 'Klasse D', url: 'https://nkbuitslagen.nl/klasse-d/' },
     { name: 'Klasse E', url: 'https://nkbuitslagen.nl/klasse-e/' },
-    { name: 'Klasse F', url: 'https://nkbuitslagen.nl/klasse-f/' },
   ],
   senioren: [
     { name: 'Hoofdklasse',  url: 'https://nkbuitslagen.nl/hoofdklasse/' },
