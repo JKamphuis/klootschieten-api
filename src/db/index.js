@@ -470,7 +470,44 @@ function getMatchById(db, id, clubIds = []) {
  * Supports same filters as queryMatches (league, category, source, team, etc.)
  * plus clubIds access restriction.
  */
+/**
+ * When a team filter is supplied, look up which league(s) that team plays in
+ * and expand the filters to include those leagues. This ensures the full
+ * league ranking is returned rather than just the matches involving that team.
+ */
+function expandTeamToLeague(db, filters) {
+  if (!filters.team) return filters;
+
+  // Find all league IDs this team participates in
+  const leagues = db.prepare(`
+    SELECT DISTINCT l.name AS league, l.source AS source
+    FROM matches m
+    JOIN leagues l  ON l.id = m.league_id
+    JOIN teams   ht ON ht.id = m.home_team_id
+    JOIN teams   at ON at.id = m.away_team_id
+    WHERE ht.display_name LIKE '%' || ? || '%'
+       OR at.display_name LIKE '%' || ? || '%'
+  `).all(filters.team, filters.team);
+
+  if (leagues.length === 0) return filters;
+
+  // If team plays in exactly one league, expand to that league and drop team filter
+  if (leagues.length === 1) {
+    const { league, source } = leagues[0];
+    const expanded = { ...filters };
+    delete expanded.team;
+    expanded.league = league;
+    if (!expanded.source) expanded.source = source;
+    return expanded;
+  }
+
+  // Multiple leagues — keep team filter but note we can't expand cleanly
+  return filters;
+}
+
 function computeRanking(db, filters = {}, clubIds = []) {
+  // Expand team filter to full league so ranking includes all teams in that league
+  filters = expandTeamToLeague(db, filters);
   const stats = {};
 
   function getOrInit(teamName, clubName) {
