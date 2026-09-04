@@ -165,6 +165,11 @@ async function scrapeLeague(page, league, category) {
       const scoreH = cells[4] || '';
       const scoreA = cells[5] || '';
 
+      // Debug: log any row that has a non-zero score so we can verify parsing
+      if (scoreH !== '' && scoreH !== '0') {
+        console.log(`    [score-debug] ${homeRaw} ${scoreH}-${scoreA} ${awayRaw} (${dateRaw})`);
+      }
+
       matches.push({
         source     : 'nkb',
         category,
