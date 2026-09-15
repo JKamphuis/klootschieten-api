@@ -178,8 +178,8 @@ async function scrapeLeague(page, league, category) {
         speeldag   : null,
         home_team  : parseTeam(homeRaw),
         away_team  : parseTeam(awayRaw),
-        home_score : scoreH !== '' ? (parseInt(scoreH, 10) || null) : null,
-        away_score : scoreA !== '' ? (parseInt(scoreA, 10) || null) : null,
+        home_score : scoreH !== '' && !isNaN(parseInt(scoreH, 10)) ? parseInt(scoreH, 10) : null,
+        away_score : scoreA !== '' && !isNaN(parseInt(scoreA, 10)) ? parseInt(scoreA, 10) : null,
         location   : null,
         source_url : league.url,
       });
