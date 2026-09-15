@@ -2,12 +2,9 @@
 /**
  * src/scraper/nkb.js
  *
- * DataTables note: NKB uses DataTables which renders ALL rows in the DOM
- * but hides non-visible pages with display:none. Pagination buttons
- * show/hide rows without changing the DOM count.
- *
- * Strategy: click "Volgende" to advance pages, collect only VISIBLE rows
- * each time using page.$$eval filtering on offsetParent !== null.
+ * NKB uses DataTables which renders ALL rows in the DOM but hides
+ * non-visible pages with display:none. We use page.evaluate() to
+ * read only visible rows directly in the browser context.
  */
 
 const playwright = require('playwright');
@@ -46,73 +43,89 @@ const DUTCH_MONTHS_NKB = {
 function parseNkbDate(raw) {
   if (!raw) return null;
   raw = raw.trim();
-  // YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
-  // DD-MM-YYYY
   const dmy = raw.match(/^(\d{2})-(\d{2})-(\d{4})/);
   if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
-  // Dutch long form: "2 mei 2027" or "12 september 2026"
   const dutch = raw.match(/(\d{1,2})\s+([a-z]+)\s+(\d{4})/i);
   if (dutch) {
     const month = DUTCH_MONTHS_NKB[dutch[2].toLowerCase()];
     if (month) {
-      const mm = String(month).padStart(2, '0');
-      const dd = dutch[1].padStart(2, '0');
-      return `${dutch[3]}-${mm}-${dd}`;
+      return `${dutch[3]}-${String(month).padStart(2,'0')}-${dutch[1].padStart(2,'0')}`;
     }
   }
   return null;
 }
 
+function parseScore(h, a) {
+  const hi = parseInt(h, 10);
+  const ai = parseInt(a, 10);
+  if (isNaN(hi) || isNaN(ai)) return { home: null, away: null };
+  if (hi === 0 && ai === 0)   return { home: null, away: null }; // not played yet
+  return { home: hi, away: ai };
+}
+
 /**
- * Extract visible rows from the first table via page.evaluate.
- * DataTables hides rows with display:none — we filter those out.
- * Returns array of plain objects with the cell text values.
- *
- * Columns: 0=Klasse 1=Wedstrijddag 2=Thuis 3=Uit 4=Thuis score 5=Uit score 6=Verslag
+ * Read all visible rows from the table via page.evaluate.
+ * Returns array of string arrays (one per row, one string per cell).
+ * Uses data-order attribute first (DataTables sort key), then innerText.
  */
 async function getVisibleRows(page) {
   return page.evaluate(() => {
     const table = document.querySelector('table');
     if (!table) return [];
-    const rows = Array.from(table.querySelectorAll('tbody tr'));
-    return rows
-      .filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0)
-      .map(tr => {
-        const cells = Array.from(tr.querySelectorAll('td'));
-        return cells.map(td => {
-          // Prefer data-order attribute (DataTables often stores sort value there,
-          // which for dates is the ISO date string)
+    return Array.from(table.querySelectorAll('tbody tr'))
+      .filter(tr => {
+        if (tr.style.display === 'none') return false;
+        if (tr.offsetHeight === 0) return false;
+        // Skip loading/empty placeholder rows (colspan > 1)
+        const cells = tr.querySelectorAll('td');
+        if (cells.length === 1 && cells[0].getAttribute('colspan') > 1) return false;
+        return true;
+      })
+      .map(tr =>
+        Array.from(tr.querySelectorAll('td')).map(td => {
           const dataOrder = td.getAttribute('data-order') || td.getAttribute('data-sort');
           if (dataOrder) return dataOrder.trim();
-          // Fall back to innerText with collapsed whitespace
           return (td.innerText || td.textContent || '').replace(/\s+/g, ' ').trim();
-        });
-      });
+        })
+      );
   });
-}
-
-/** Log first visible row raw HTML for debugging — called once per league */
-async function debugFirstRow(page) {
-  const info = await page.evaluate(() => {
-    const table = document.querySelector('table');
-    if (!table) return 'no table';
-    const rows = Array.from(table.querySelectorAll('tbody tr'));
-    const visible = rows.filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
-    if (!visible.length) return 'no visible rows';
-    return visible[0].innerHTML.slice(0, 800);
-  });
-  console.log('    [debug] first row HTML:', info);
 }
 
 /**
- * Get the active page number from the DataTables pagination info.
- * Returns null if not found.
+ * Wait for the table to show real data rows (not just a Laden... spinner).
+ * Returns true if data is ready, false if the table is genuinely empty.
  */
-async function getActivePage(page) {
+async function waitForTableData(page) {
+  try {
+    await page.waitForFunction(() => {
+      const rows = Array.from(document.querySelectorAll('table tbody tr'))
+        .filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
+      if (!rows.length) return false;
+      // If only one row and it has a colspan, it's still loading or empty
+      if (rows.length === 1) {
+        const firstCell = rows[0].querySelector('td');
+        if (firstCell && parseInt(firstCell.getAttribute('colspan')) > 1) return false;
+      }
+      return true;
+    }, { timeout: 25_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get a fingerprint of the current first visible row's text content.
+ * Used to detect when DataTables has re-rendered after a page click.
+ */
+async function getFirstRowFingerprint(page) {
   return page.evaluate(() => {
-    const active = document.querySelector('button.dt-paging-button.current, .paginate_button.current');
-    return active ? active.textContent.trim() : null;
+    const rows = Array.from(document.querySelectorAll('table tbody tr'))
+      .filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
+    if (!rows.length) return '';
+    return Array.from(rows[0].querySelectorAll('td'))
+      .map(td => (td.innerText || '').trim()).join('|');
   });
 }
 
@@ -121,22 +134,8 @@ async function scrapeLeague(page, league, category) {
 
   await page.goto(league.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-  // Wait for real data rows — not the "Laden..." placeholder
-  try {
-    await page.waitForFunction(() => {
-      const rows = Array.from(document.querySelectorAll('table tbody tr'));
-      const visible = rows.filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
-      if (!visible.length) return false;
-      // Reject if the only visible row is a colspan "Laden..." or "dt-empty" cell
-      if (visible.length === 1) {
-        const firstCell = visible[0].querySelector('td');
-        if (!firstCell) return false;
-        const colspan = firstCell.getAttribute('colspan');
-        if (colspan && parseInt(colspan) > 1) return false;  // loading/empty placeholder
-      }
-      return true;
-    }, { timeout: 20_000 });
-  } catch {
+  const hasData = await waitForTableData(page);
+  if (!hasData) {
     console.log('    → tabel leeg / seizoen nog niet begonnen');
     return [];
   }
@@ -144,30 +143,18 @@ async function scrapeLeague(page, league, category) {
   const matches = [];
   let pageNum = 1;
 
-  // Debug: log raw HTML of first row to reveal date cell structure
-  await debugFirstRow(page);
-
   while (true) {
-    // Read only currently visible rows
     const rows = await getVisibleRows(page);
-    console.log(`    → pagina ${pageNum}: ${rows.length} rijen zichtbaar`);
+    console.log(`    → pagina ${pageNum}: ${rows.length} rijen`);
 
     for (const cells of rows) {
       if (cells.length < 4) continue;
-
-      // col 1 = Wedstrijddag, col 2 = Thuis, col 3 = Uit
-      const dateRaw  = cells[1] || '';
-      const homeRaw  = cells[2] || '';
-      const awayRaw  = cells[3] || '';
+      const dateRaw = cells[1] || '';
+      const homeRaw = cells[2] || '';
+      const awayRaw = cells[3] || '';
       if (!homeRaw || !awayRaw) continue;
 
-      const scoreH = cells[4] || '';
-      const scoreA = cells[5] || '';
-
-      // Debug: log any row that has a non-zero score so we can verify parsing
-      if (scoreH !== '' && scoreH !== '0') {
-        console.log(`    [score-debug] ${homeRaw} ${scoreH}-${scoreA} ${awayRaw} (${dateRaw})`);
-      }
+      const { home: homeScore, away: awayScore } = parseScore(cells[4] || '', cells[5] || '');
 
       matches.push({
         source     : 'nkb',
@@ -178,71 +165,45 @@ async function scrapeLeague(page, league, category) {
         speeldag   : null,
         home_team  : parseTeam(homeRaw),
         away_team  : parseTeam(awayRaw),
-        // A real klootschieten result always has at least one non-zero score.
-        // If both cells are 0, the match hasn't been played yet.
-        home_score : (() => {
-          const h = parseInt(scoreH, 10);
-          const a = parseInt(scoreA, 10);
-          if (isNaN(h) || isNaN(a)) return null;   // not yet entered
-          if (h === 0 && a === 0)   return null;   // placeholder zeros = not played
-          return h;
-        })(),
-        away_score : (() => {
-          const h = parseInt(scoreH, 10);
-          const a = parseInt(scoreA, 10);
-          if (isNaN(h) || isNaN(a)) return null;
-          if (h === 0 && a === 0)   return null;
-          return a;
-        })(),
+        home_score : homeScore,
+        away_score : awayScore,
         location   : null,
         source_url : league.url,
       });
     }
 
-    // Find the Next button
+    // Check if Next button exists and is enabled
     const nextBtn = await page.$('button.dt-paging-button.next');
-    if (!nextBtn) {
-      console.log('    → geen volgende-knop gevonden, klaar');
-      break;
-    }
+    if (!nextBtn) break;
 
-    // Check disabled state — DataTables sets both class and attribute
-    const isDisabled = await page.evaluate(btn => {
-      return btn.disabled ||
-        btn.classList.contains('disabled') ||
-        btn.getAttribute('aria-disabled') === 'true';
-    }, nextBtn);
+    const isDisabled = await page.evaluate(
+      btn => btn.disabled || btn.classList.contains('disabled'),
+      nextBtn
+    );
+    if (isDisabled) break;
 
-    if (isDisabled) {
-      console.log('    → laatste pagina bereikt');
-      break;
-    }
-
-    // Remember which page we're on before clicking
-    const currentPage = await getActivePage(page);
+    // Take a fingerprint of the current first row before clicking
+    const fingerprintBefore = await getFirstRowFingerprint(page);
 
     await nextBtn.click();
 
-    // Wait until the active page indicator changes, meaning DataTables
-    // has finished re-rendering the visible rows — max 5 seconds
+    // Wait until the first visible row changes — simple and reliable
     try {
-      await page.waitForFunction((prevPage) => {
-        const active = document.querySelector(
-          'button.dt-paging-button.current, .paginate_button.current'
-        );
-        return active && active.textContent.trim() !== prevPage;
-      }, currentPage, { timeout: 5_000 });
+      await page.waitForFunction((before) => {
+        const rows = Array.from(document.querySelectorAll('table tbody tr'))
+          .filter(tr => tr.style.display !== 'none' && tr.offsetHeight > 0);
+        if (!rows.length) return false;
+        const current = Array.from(rows[0].querySelectorAll('td'))
+          .map(td => (td.innerText || '').trim()).join('|');
+        return current !== before && current !== '';
+      }, fingerprintBefore, { timeout: 8_000 });
     } catch {
-      // If the page indicator didn't change, we're stuck — stop here
       console.log('    → paginering reageert niet, stoppen');
       break;
     }
 
     pageNum++;
-    if (pageNum > 20) {
-      console.log('    → veiligheidsgrens van 20 paginas bereikt');
-      break;
-    }
+    if (pageNum > 20) break;
   }
 
   console.log(`    → totaal: ${matches.length} wedstrijden`);
@@ -256,8 +217,6 @@ async function scrapeAllNkb() {
   try {
     for (const [category, leagues] of Object.entries(LEAGUES)) {
       for (const league of leagues) {
-        // Fresh page per league — avoids interrupted navigation errors from
-        // the previous page still loading when we navigate to the next one.
         const page = await browser.newPage();
         try {
           all.push(...await scrapeLeague(page, league, category));
@@ -266,8 +225,8 @@ async function scrapeAllNkb() {
         } finally {
           await page.close();
         }
-        // Brief pause between leagues to avoid rate-limiting
-        await new Promise(r => setTimeout(r, 1500));
+        // Brief pause between leagues
+        await new Promise(r => setTimeout(r, 1000));
       }
     }
   } finally {
