@@ -178,8 +178,22 @@ async function scrapeLeague(page, league, category) {
         speeldag   : null,
         home_team  : parseTeam(homeRaw),
         away_team  : parseTeam(awayRaw),
-        home_score : scoreH !== '' && !isNaN(parseInt(scoreH, 10)) ? parseInt(scoreH, 10) : null,
-        away_score : scoreA !== '' && !isNaN(parseInt(scoreA, 10)) ? parseInt(scoreA, 10) : null,
+        // A real klootschieten result always has at least one non-zero score.
+        // If both cells are 0, the match hasn't been played yet.
+        home_score : (() => {
+          const h = parseInt(scoreH, 10);
+          const a = parseInt(scoreA, 10);
+          if (isNaN(h) || isNaN(a)) return null;   // not yet entered
+          if (h === 0 && a === 0)   return null;   // placeholder zeros = not played
+          return h;
+        })(),
+        away_score : (() => {
+          const h = parseInt(scoreH, 10);
+          const a = parseInt(scoreA, 10);
+          if (isNaN(h) || isNaN(a)) return null;
+          if (h === 0 && a === 0)   return null;
+          return a;
+        })(),
         location   : null,
         source_url : league.url,
       });
