@@ -329,13 +329,18 @@ function upsertMatch(db, row) {
     return 'added';
   }
 
+  // Never overwrite a real score with null — if a scrape fails to load the
+  // table, it returns null scores which must not clobber previously stored results.
+  const scoreHome = row.home_score !== null ? row.home_score : existing.home_score;
+  const scoreAway = row.away_score !== null ? row.away_score : existing.away_score;
+
   // Check if anything actually changed
   const changed =
     existing.match_date  !== row.match_date  ||
     existing.match_time  !== row.match_time  ||
     existing.speeldag    !== row.speeldag    ||
-    existing.home_score  !== row.home_score  ||
-    existing.away_score  !== row.away_score  ||
+    existing.home_score  !== scoreHome       ||
+    existing.away_score  !== scoreAway       ||
     existing.location    !== row.location;
 
   if (changed) {
@@ -349,7 +354,7 @@ function upsertMatch(db, row) {
           location    = @location,
           fetched_at  = datetime('now')
       WHERE id = @id
-    `).run({ ...row, id: existing.id });
+    `).run({ ...row, id: existing.id, home_score: scoreHome, away_score: scoreAway });
     return 'updated';
   }
 
