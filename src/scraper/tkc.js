@@ -112,7 +112,11 @@ async function scrapeTkcPage({ url, category }) {
         const eventRaw = $(cells[1]).find('a').first().text().trim()
           || $(cells[1]).text().trim();
         const tegenM = eventRaw.match(/^(.+?)\s+tegen\s+(.+)$/i);
-        if (!tegenM) return;
+        if (!tegenM) {
+          // Debug: log rows that don't match so we can see what's in them
+          if (eventRaw) console.log(`    [tkc-debug] geen tegen match: ${JSON.stringify(eventRaw)} (league: ${currentLeague})`);
+          return;
+        }
 
         const homeRaw = tegenM[1].trim();
         const awayRaw = tegenM[2].trim();
@@ -129,6 +133,11 @@ async function scrapeTkcPage({ url, category }) {
 
         const homeTeam = parseTeam(homeRaw);
         const awayTeam = parseTeam(awayRaw);
+
+        // Debug: log scores for Klasse 6
+        if (currentLeague.includes('6')) {
+          console.log(`    [tkc-k6] ${homeRaw} ${score.home}-${score.away} ${awayRaw} | scoreRaw: ${JSON.stringify(scoreRaw)} | date: ${matchDate}`);
+        }
 
         matches.push({
           source     : 'tkc',
