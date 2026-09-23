@@ -299,10 +299,23 @@ function getOrCreateLeague(db, { name, category, source }) {
 }
 
 function getOrCreateTeam(db, { clubId, teamNr, displayName }) {
-  const row = db.prepare(
+  // Look up by display_name first — this is the most stable identifier
+  // and avoids creating duplicate rows if team_nr changed between scraper versions.
+  const byName = db.prepare(
+    'SELECT id FROM teams WHERE club_id = ? AND display_name = ?'
+  ).get(clubId, displayName);
+  if (byName) return byName.id;
+
+  // Also check by team_nr in case display_name changed
+  const byNr = db.prepare(
     'SELECT id FROM teams WHERE club_id = ? AND team_nr = ?'
   ).get(clubId, teamNr);
-  if (row) return row.id;
+  if (byNr) {
+    // Update display_name to match current scraper output
+    db.prepare('UPDATE teams SET display_name = ? WHERE id = ?').run(displayName, byNr.id);
+    return byNr.id;
+  }
+
   return db.prepare(
     'INSERT INTO teams (club_id, team_nr, display_name) VALUES (?, ?, ?)'
   ).run(clubId, teamNr, displayName).lastInsertRowid;
