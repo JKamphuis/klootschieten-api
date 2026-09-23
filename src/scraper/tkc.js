@@ -136,7 +136,7 @@ async function scrapeTkcPage({ url, category }) {
 
         // Debug: log scores for Klasse 6
         if (currentLeague.includes('6')) {
-          console.log(`    [tkc-k6] ${homeRaw} ${score.home}-${score.away} ${awayRaw} | scoreRaw: ${JSON.stringify(scoreRaw)} | date: ${matchDate}`);
+          console.log(`    [tkc-k6] ${homeRaw} ${score.home}-${score.away} ${awayRaw} | scoreRaw: ${JSON.stringify(scoreRaw)} | date: ${matchDate} `);
         }
 
         matches.push({
